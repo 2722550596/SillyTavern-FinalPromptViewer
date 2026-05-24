@@ -27,15 +27,124 @@ const _fpvExtPath = (() => {
     let selectedIdx = -1;      // 当前查看的 capture 索引（captureHistory 中的下标）
     let captureSeq = 0;        // 自增 ID
     let panelVisible = false;
-    const MAX_HISTORY = 20;
 
     const msgMatchIdx = {};    // 每条消息当前激活的匹配索引
+
+    // ─── IndexedDB 本地数据库持久化 ──────────────────────────────────────
+    
+    // 修剪历史记录的方法
+    function trimHistory() {
+        if (settings.maxHistory !== -1 && captureHistory.length > settings.maxHistory) {
+            const removeCount = captureHistory.length - settings.maxHistory;
+            captureHistory = captureHistory.slice(-settings.maxHistory);
+            
+            // 修正当前选中的索引
+            if (selectedIdx !== -1) {
+                selectedIdx -= removeCount;
+                if (selectedIdx < 0) {
+                    selectedIdx = captureHistory.length > 0 ? captureHistory.length - 1 : -1;
+                }
+            }
+            return true; // 代表发生了清理
+        }
+        return false;
+    }
+
+    // 从数据库加载记录
+    async function loadLogs() {
+        try {
+            const db = await openDB();
+            const tx = db.transaction(STORE_NAME, 'readonly');
+            const request = tx.objectStore(STORE_NAME).get('history');
+            
+            request.onsuccess = () => {
+                const data = request.result;
+                if (data && Array.isArray(data)) {
+                    captureHistory = data;
+                    if (captureHistory.length > 0) {
+                        captureSeq = Math.max(...captureHistory.map(c => c.id || 0));
+                    }
+                    
+                    // 【新增】加载完数据后检查是否需要清理超出的部分
+                    if (trimHistory()) saveLogs(); 
+                    
+                    // 数据加载完毕后刷新一次界面
+                    renderHistoryBar();
+                    renderMessages();
+                }
+            };
+        } catch (e) {
+            console.warn('[最终提示词查看器] 无法读取 IndexedDB 日志', e);
+        }
+    }
+
+    const DB_NAME = 'FPV_Database';
+    const STORE_NAME = 'capture_logs';
+
+    // 初始化/打开数据库
+    function openDB() {
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open(DB_NAME, 1);
+            request.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains(STORE_NAME)) {
+                    db.createObjectStore(STORE_NAME);
+                }
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    // 从数据库加载记录
+    async function loadLogs() {
+        try {
+            const db = await openDB();
+            const tx = db.transaction(STORE_NAME, 'readonly');
+            const request = tx.objectStore(STORE_NAME).get('history');
+            
+            request.onsuccess = () => {
+                const data = request.result;
+                if (data && Array.isArray(data)) {
+                    captureHistory = data;
+                    if (captureHistory.length > 0) {
+                        captureSeq = Math.max(...captureHistory.map(c => c.id || 0));
+                    }
+                    // 数据加载完毕后刷新一次界面
+                    renderHistoryBar();
+                    renderMessages();
+                }
+            };
+        } catch (e) {
+            console.warn('[最终提示词查看器] 无法读取 IndexedDB 日志', e);
+        }
+    }
+
+    // 保存记录到数据库
+    async function saveLogs() {
+        try {
+            const db = await openDB();
+            const tx = db.transaction(STORE_NAME, 'readwrite');
+            const store = tx.objectStore(STORE_NAME);
+            
+            if (captureHistory.length === 0) {
+                store.delete('history');
+            } else {
+                store.put(captureHistory, 'history');
+            }
+        } catch (e) {
+            console.warn('[最终提示词查看器] IndexedDB 写入失败', e);
+        }
+    }
+
+    // 初始化时加载
+    loadLogs();
 
     // ─── 设置持久化 ──────────────────────────────────────────────────────────────
 
     const EXTENSION_SETTINGS_KEY = 'final_prompt_viewer';
     const LEGACY_SETTINGS_KEY = 'fpv_settings';
-    const DEFAULT_SETTINGS = { showFloatBtn: true, btnX: null, btnY: null };
+    const DEFAULT_SETTINGS = { showFloatBtn: true, btnX: null, btnY: null, maxHistory: 20 };
 
     function readLegacySettings() {
         try {
@@ -168,7 +277,9 @@ const _fpvExtPath = (() => {
         };
 
         captureHistory.push(capture);
-        if (captureHistory.length > MAX_HISTORY) captureHistory.shift();
+        trimHistory();
+
+        saveLogs();
 
         if (panelVisible) {
             // 面板开着：不切换视图，只刷新历史栏（新条目标为未读）
@@ -262,6 +373,7 @@ const _fpvExtPath = (() => {
         if (i < 0 || i >= captureHistory.length) return;
         selectedIdx = i;
         captureHistory[i].seen = true;
+        saveLogs();
         renderHistoryBar();
         renderMessages();
     };
@@ -270,6 +382,7 @@ const _fpvExtPath = (() => {
         captureHistory = [];
         selectedIdx = -1;
         captureSeq = 0;
+        saveLogs();
         renderHistoryBar();
         renderMessages();
     };
@@ -490,7 +603,10 @@ const _fpvExtPath = (() => {
         const badge = document.getElementById('fpv-badge');
         if (badge) badge.style.display = 'none';
         // 标记当前选中为已读
-        if (captureHistory[selectedIdx]) captureHistory[selectedIdx].seen = true;
+        if (captureHistory[selectedIdx]) {
+            captureHistory[selectedIdx].seen = true;
+            saveLogs(); // 标记已读后保存
+        }
         renderHistoryBar();
         renderMessages();
     }
@@ -580,6 +696,10 @@ const _fpvExtPath = (() => {
     <span id="fpv-match-count"></span>
     <button onclick="window._fpvExpandAll()">展开全部</button>
     <button onclick="window._fpvCollapseAll()">折叠全部</button>
+    <div id="fpv-limit-wrap" title="超过此楼层自动清理最旧记录。填 -1 不清理">
+      <label for="fpv-max-history">保留</label>
+      <input id="fpv-max-history" type="number" min="-1" step="1" />
+    </div>
     <button onclick="window._fpvClearHistory()" title="清空历史记录">清空历史</button>
     <button id="fpv-close-btn" onclick="window._fpvClose()">✕</button>
   </div>
@@ -604,6 +724,27 @@ const _fpvExtPath = (() => {
             searchInput.focus();
         });
         syncClearSearchButton();
+
+        // 【新增】保留楼层 input 逻辑
+        const maxHistoryInput = document.getElementById('fpv-max-history');
+        if (maxHistoryInput) {
+            maxHistoryInput.value = settings.maxHistory;
+            maxHistoryInput.addEventListener('change', (e) => {
+                let val = parseInt(e.target.value, 10);
+                if (isNaN(val) || val < -1) val = 20; // 兜底容错
+                e.target.value = val;
+                
+                settings.maxHistory = val;
+                saveSettings();
+                
+                // 如果用户调小了数值，立刻触发清理
+                if (trimHistory()) {
+                    saveLogs();
+                    renderHistoryBar();
+                    renderMessages();
+                }
+            });
+        }
 
         // 面板拖拽：Pointer Events 让桌面鼠标和移动端触摸共用同一套逻辑。
         const panelHeader = document.getElementById('fpv-header');
@@ -634,46 +775,124 @@ const _fpvExtPath = (() => {
         panelHeader.addEventListener('pointerup', endPanelPointerDrag);
         panelHeader.addEventListener('pointercancel', endPanelPointerDrag);
 
-        // 浮动按钮拖拽：Pointer Events 同时覆盖鼠标、触控笔和移动端手指。
-        let btnPointerId = null, btnDragging = false, btnStartX = 0, btnStartY = 0, suppressNextBtnClick = false;
+        // 浮动按钮拖拽：终极丝滑方案 (GPU加速 + Pointer Capture + 屏幕边缘钳制)
+        let drag = false, moved = false;
+        let startX = 0, startY = 0;
+        let initLeft = 0, initTop = 0;
+        let rafId = null;
+
         btn.addEventListener('pointerdown', e => {
-            if (btnPointerId !== null) return;
-            btnPointerId = e.pointerId;
-            btnDragging = false;
-            btnStartX = e.clientX;
-            btnStartY = e.clientY;
-            btn.setPointerCapture?.(e.pointerId);
-            e.preventDefault();
-        });
-        btn.addEventListener('pointermove', e => {
-            if (btnPointerId !== e.pointerId) return;
-            if (!btnDragging && Math.hypot(e.clientX - btnStartX, e.clientY - btnStartY) < 4) return;
-            btnDragging = true;
-            const r = btn.getBoundingClientRect();
-            btn.style.left = (e.clientX - r.width / 2) + 'px';
-            btn.style.top  = (e.clientY - r.height / 2) + 'px';
-            btn.style.right = 'auto'; btn.style.bottom = 'auto';
-            keepElementInViewport(btn, 8);
-            e.preventDefault();
-        });
-        const endBtnPointerDrag = e => {
-            if (btnPointerId !== e.pointerId) return;
-            if (btnDragging) {
-                keepElementInViewport(btn, 8);
-                settings.btnX = parseInt(btn.style.left, 10);
-                settings.btnY = parseInt(btn.style.top, 10);
-                saveSettings();
-                suppressNextBtnClick = true;
+            if (e.button && e.button !== 0) return; // 忽略鼠标右键
+            
+            drag = true;
+            moved = false;
+            
+            // 1. 指针锁定：锁死焦点，鼠标甩飞也不会丢失拖拽状态
+            if (e.pointerId) btn.setPointerCapture?.(e.pointerId);
+
+            startX = e.clientX;
+            startY = e.clientY;
+
+            // 获取当前真实的左上角坐标
+            const rect = btn.getBoundingClientRect();
+            
+            // 确保坐标系统一（处理初始从 right/bottom 定位的情况）
+            if (btn.style.right || btn.style.bottom) {
+                btn.style.right = '';
+                btn.style.bottom = '';
+                btn.style.left = rect.left + 'px';
+                btn.style.top = rect.top + 'px';
             }
-            btn.releasePointerCapture?.(e.pointerId);
-            btnPointerId = null;
-            btnDragging = false;
+            
+            initLeft = rect.left;
+            initTop = rect.top;
+
+            // 2. 开启 GPU 硬件加速并禁用 transition 避免拖拽延迟
+            btn.style.transition = 'none';
+            btn.style.willChange = 'transform';
+            btn.style.cursor = 'grabbing';
+            btn.classList.add('fpv-dragging');
+            e.preventDefault();
+        });
+
+        btn.addEventListener('pointermove', e => {
+            if (!drag) return;
+
+            let dx = e.clientX - startX;
+            let dy = e.clientY - startY;
+
+            // 判定为实际拖拽的阈值（防手抖）
+            if (!moved) {
+                if (Math.abs(dx) < 5 && Math.abs(dy) < 5) return;
+                moved = true;
+            }
+
+            // 3. 计算屏幕边界，实时限制 dx 和 dy 避免悬浮球拖出屏幕
+            const cw = btn.offsetWidth || 44;
+            const ch = btn.offsetHeight || 44;
+            const vw = window.innerWidth;
+            const vh = window.innerHeight;
+
+            const minDx = -initLeft;
+            const maxDx = vw - cw - initLeft;
+            const minDy = -initTop;
+            const maxDy = vh - ch - initTop;
+
+            // 钳制数值，保证绝对不会越界（完美撞墙手感）
+            dx = Math.max(minDx, Math.min(dx, maxDx));
+            dy = Math.max(minDy, Math.min(dy, maxDy));
+
+            if (rafId) cancelAnimationFrame(rafId);
+            rafId = requestAnimationFrame(() => {
+                btn.style.transform = `translate3d(${dx}px, ${dy}px, 0) scale(1.1)`;
+            });
+            e.preventDefault();
+        });
+
+        const endBtnPointerDrag = e => {
+            if (!drag) return;
+            drag = false;
+
+            if (rafId) cancelAnimationFrame(rafId);
+
+            let dx = e.clientX - startX;
+            let dy = e.clientY - startY;
+
+            const cw = btn.offsetWidth || 44;
+            const ch = btn.offsetHeight || 44;
+            const w = window.innerWidth;
+            const h = window.innerHeight;
+
+            // 边界约束计算最终位置
+            const finalLeft = Math.max(0, Math.min(initLeft + dx, w - cw));
+            const finalTop  = Math.max(0, Math.min(initTop + dy, h - ch));
+
+            // 4. 拖拽结束：清空 GPU transform 虚拟位移，一次性固化为真实的 left/top
+            btn.style.transform = '';
+            btn.style.left = finalLeft + 'px';
+            btn.style.top  = finalTop + 'px';
+            btn.style.willChange = 'auto'; // 释放 GPU 内存
+            btn.style.cursor = 'pointer';
+            btn.classList.remove('fpv-dragging');
+
+            // 解除指针锁定
+            if (e.pointerId) btn.releasePointerCapture?.(e.pointerId);
+
+            // 如果发生了移动，则保存坐标
+            if (moved) {
+                settings.btnX = finalLeft;
+                settings.btnY = finalTop;
+                saveSettings();
+            }
         };
+
         btn.addEventListener('pointerup', endBtnPointerDrag);
         btn.addEventListener('pointercancel', endBtnPointerDrag);
+
         btn.addEventListener('click', e => {
-            if (suppressNextBtnClick) {
-                suppressNextBtnClick = false;
+            // 5. 点击拦截：如果是拖拽带来的 click 事件，则拦截它，不展开面板
+            if (moved) {
+                moved = false; // 消费掉这次状态
                 e.preventDefault();
                 e.stopImmediatePropagation();
                 return;
