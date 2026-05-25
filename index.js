@@ -27,15 +27,124 @@ const _fpvExtPath = (() => {
     let selectedIdx = -1;      // 当前查看的 capture 索引（captureHistory 中的下标）
     let captureSeq = 0;        // 自增 ID
     let panelVisible = false;
-    const MAX_HISTORY = 20;
 
     const msgMatchIdx = {};    // 每条消息当前激活的匹配索引
+
+    // ─── IndexedDB 本地数据库持久化 ──────────────────────────────────────
+    
+    // 修剪历史记录的方法
+    function trimHistory() {
+        if (settings.maxHistory !== -1 && captureHistory.length > settings.maxHistory) {
+            const removeCount = captureHistory.length - settings.maxHistory;
+            captureHistory = captureHistory.slice(-settings.maxHistory);
+            
+            // 修正当前选中的索引
+            if (selectedIdx !== -1) {
+                selectedIdx -= removeCount;
+                if (selectedIdx < 0) {
+                    selectedIdx = captureHistory.length > 0 ? captureHistory.length - 1 : -1;
+                }
+            }
+            return true; // 代表发生了清理
+        }
+        return false;
+    }
+
+    // 从数据库加载记录
+    async function loadLogs() {
+        try {
+            const db = await openDB();
+            const tx = db.transaction(STORE_NAME, 'readonly');
+            const request = tx.objectStore(STORE_NAME).get('history');
+            
+            request.onsuccess = () => {
+                const data = request.result;
+                if (data && Array.isArray(data)) {
+                    captureHistory = data;
+                    if (captureHistory.length > 0) {
+                        captureSeq = Math.max(...captureHistory.map(c => c.id || 0));
+                    }
+                    
+                    // 【新增】加载完数据后检查是否需要清理超出的部分
+                    if (trimHistory()) saveLogs(); 
+                    
+                    // 数据加载完毕后刷新一次界面
+                    renderHistoryBar();
+                    renderMessages();
+                }
+            };
+        } catch (e) {
+            console.warn('[最终提示词查看器] 无法读取 IndexedDB 日志', e);
+        }
+    }
+
+    const DB_NAME = 'FPV_Database';
+    const STORE_NAME = 'capture_logs';
+
+    // 初始化/打开数据库
+    function openDB() {
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open(DB_NAME, 1);
+            request.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains(STORE_NAME)) {
+                    db.createObjectStore(STORE_NAME);
+                }
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    // 从数据库加载记录
+    async function loadLogs() {
+        try {
+            const db = await openDB();
+            const tx = db.transaction(STORE_NAME, 'readonly');
+            const request = tx.objectStore(STORE_NAME).get('history');
+            
+            request.onsuccess = () => {
+                const data = request.result;
+                if (data && Array.isArray(data)) {
+                    captureHistory = data;
+                    if (captureHistory.length > 0) {
+                        captureSeq = Math.max(...captureHistory.map(c => c.id || 0));
+                    }
+                    // 数据加载完毕后刷新一次界面
+                    renderHistoryBar();
+                    renderMessages();
+                }
+            };
+        } catch (e) {
+            console.warn('[最终提示词查看器] 无法读取 IndexedDB 日志', e);
+        }
+    }
+
+    // 保存记录到数据库
+    async function saveLogs() {
+        try {
+            const db = await openDB();
+            const tx = db.transaction(STORE_NAME, 'readwrite');
+            const store = tx.objectStore(STORE_NAME);
+            
+            if (captureHistory.length === 0) {
+                store.delete('history');
+            } else {
+                store.put(captureHistory, 'history');
+            }
+        } catch (e) {
+            console.warn('[最终提示词查看器] IndexedDB 写入失败', e);
+        }
+    }
+
+    // 初始化时加载
+    loadLogs();
 
     // ─── 设置持久化 ──────────────────────────────────────────────────────────────
 
     const EXTENSION_SETTINGS_KEY = 'final_prompt_viewer';
     const LEGACY_SETTINGS_KEY = 'fpv_settings';
-    const DEFAULT_SETTINGS = { showFloatBtn: true, btnX: null, btnY: null };
+    const DEFAULT_SETTINGS = { showFloatBtn: true, btnX: null, btnY: null, maxHistory: 20 };
 
     function readLegacySettings() {
         try {
@@ -168,7 +277,9 @@ const _fpvExtPath = (() => {
         };
 
         captureHistory.push(capture);
-        if (captureHistory.length > MAX_HISTORY) captureHistory.shift();
+        trimHistory();
+
+        saveLogs();
 
         if (panelVisible) {
             // 面板开着：不切换视图，只刷新历史栏（新条目标为未读）
@@ -262,6 +373,7 @@ const _fpvExtPath = (() => {
         if (i < 0 || i >= captureHistory.length) return;
         selectedIdx = i;
         captureHistory[i].seen = true;
+        saveLogs();
         renderHistoryBar();
         renderMessages();
     };
@@ -270,6 +382,7 @@ const _fpvExtPath = (() => {
         captureHistory = [];
         selectedIdx = -1;
         captureSeq = 0;
+        saveLogs();
         renderHistoryBar();
         renderMessages();
     };
@@ -490,7 +603,10 @@ const _fpvExtPath = (() => {
         const badge = document.getElementById('fpv-badge');
         if (badge) badge.style.display = 'none';
         // 标记当前选中为已读
-        if (captureHistory[selectedIdx]) captureHistory[selectedIdx].seen = true;
+        if (captureHistory[selectedIdx]) {
+            captureHistory[selectedIdx].seen = true;
+            saveLogs(); // 标记已读后保存
+        }
         renderHistoryBar();
         renderMessages();
     }
@@ -580,6 +696,10 @@ const _fpvExtPath = (() => {
     <span id="fpv-match-count"></span>
     <button onclick="window._fpvExpandAll()">展开全部</button>
     <button onclick="window._fpvCollapseAll()">折叠全部</button>
+    <div id="fpv-limit-wrap" title="超过此楼层自动清理最旧记录。填 -1 不清理">
+      <label for="fpv-max-history">保留</label>
+      <input id="fpv-max-history" type="number" min="-1" step="1" />
+    </div>
     <button onclick="window._fpvClearHistory()" title="清空历史记录">清空历史</button>
     <button id="fpv-close-btn" onclick="window._fpvClose()">✕</button>
   </div>
@@ -604,6 +724,27 @@ const _fpvExtPath = (() => {
             searchInput.focus();
         });
         syncClearSearchButton();
+
+        // 【新增】保留楼层 input 逻辑
+        const maxHistoryInput = document.getElementById('fpv-max-history');
+        if (maxHistoryInput) {
+            maxHistoryInput.value = settings.maxHistory;
+            maxHistoryInput.addEventListener('change', (e) => {
+                let val = parseInt(e.target.value, 10);
+                if (isNaN(val) || val < -1) val = 20; // 兜底容错
+                e.target.value = val;
+                
+                settings.maxHistory = val;
+                saveSettings();
+                
+                // 如果用户调小了数值，立刻触发清理
+                if (trimHistory()) {
+                    saveLogs();
+                    renderHistoryBar();
+                    renderMessages();
+                }
+            });
+        }
 
         // 面板拖拽：Pointer Events 让桌面鼠标和移动端触摸共用同一套逻辑。
         const panelHeader = document.getElementById('fpv-header');
