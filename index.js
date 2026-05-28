@@ -642,10 +642,10 @@ const _fpvExtPath = (() => {
 
         btn.addEventListener('pointerdown', e => {
             if (e.button && e.button !== 0) return; // 忽略鼠标右键
-            
+
             drag = true;
             moved = false;
-            
+
             // 1. 指针锁定：锁死焦点，鼠标甩飞也不会丢失拖拽状态
             if (e.pointerId) btn.setPointerCapture?.(e.pointerId);
 
@@ -654,7 +654,7 @@ const _fpvExtPath = (() => {
 
             // 获取当前真实的左上角坐标
             const rect = btn.getBoundingClientRect();
-            
+
             // 确保坐标系统一（处理初始从 right/bottom 定位的情况）
             if (btn.style.right || btn.style.bottom) {
                 btn.style.right = '';
@@ -662,7 +662,7 @@ const _fpvExtPath = (() => {
                 btn.style.left = rect.left + 'px';
                 btn.style.top = rect.top + 'px';
             }
-            
+
             initLeft = rect.left;
             initTop = rect.top;
 
@@ -730,6 +730,7 @@ const _fpvExtPath = (() => {
             btn.style.transform = '';
             btn.style.left = finalLeft + 'px';
             btn.style.top  = finalTop + 'px';
+            btn.style.transition = '';
             btn.style.willChange = 'auto'; // 释放 GPU 内存
             btn.style.cursor = 'pointer';
             btn.classList.remove('fpv-dragging');
